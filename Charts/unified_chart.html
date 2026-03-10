@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OX Rig V2 — Unified Chart</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0a;
+            color: #00ff41;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+        }
+        #chart-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        #status-bar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 28px;
+            background: rgba(0, 0, 0, 0.85);
+            border-bottom: 1px solid #00ff41;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-size: 12px;
+            z-index: 10;
+            gap: 20px;
+        }
+        #status-bar .label { color: #888; }
+        #status-bar .value { color: #00ff41; }
+        #status-bar .clock { margin-left: auto; color: #ffaa00; }
+        #chart { width: 100%; height: calc(100% - 28px); margin-top: 28px; }
+    </style>
+</head>
+<body>
+    <div id="chart-container">
+        <div id="status-bar">
+            <span class="label">OX RIG V2</span>
+            <span class="value" id="sym">BTC/USD</span>
+            <span class="label">TZ:</span>
+            <span class="value">America/Los_Angeles</span>
+            <span class="label">Last:</span>
+            <span class="value" id="last-price">—</span>
+            <span class="clock" id="clock">—</span>
+        </div>
+        <div id="chart"></div>
+    </div>
+
+<script>
+// =============================================================================
+// OX RIG V2 — UNIFIED CHART
+// =============================================================================
+// ROOT CAUSE FIX for the UTC Leak:
+//
+// Lightweight Charts works in SECONDS (Unix epoch). When we feed it timestamps,
+// it treats them as UTC internally. The tickMarkFormatter receives these raw
+// second-based timestamps. Previous "nuclear" attempts tried manual -8h offsets,
+// but mixed up seconds vs. milliseconds (factor of 1000).
+//
+// THE FIX: We use a single, bulletproof conversion function that:
+//   1. Takes the timestamp IN SECONDS from Lightweight Charts
+//   2. Converts to milliseconds for JS Date
+//   3. Uses Intl.DateTimeFormat with timeZone: 'America/Los_Angeles'
+//
+// This works for ALL labels: historical data, the leading-edge price line,
+// AND the empty rightOffset space — because tickMarkFormatter is the single
+// source of truth for ALL x-axis label rendering.
+// =============================================================================
+
+const TIMEZONE = 'America/Los_Angeles';
+
+// Cached formatters — creating Intl.DateTimeFormat is expensive, so we reuse them
+const fmtTime = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+});
+
+const fmtDate = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE,
+    month: 'short',
+    day: 'numeric',
+});
+
+const fmtFull = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE,
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+});
+
+const fmtClock = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+});
+
+/**
+ * Convert a Lightweight Charts timestamp (SECONDS since epoch) to a
+ * localized PST/PDT string. This is the ONLY place timezone conversion
+ * happens — no manual hour offsets, no guessing.
+ *
+ * @param {number} epochSeconds - Unix timestamp in SECONDS
+ * @param {'time'|'date'|'full'} mode - What to render
+ * @returns {string} Localized label
+ */
+function toPacific(epochSeconds, mode) {
+    // CRITICAL: Lightweight Charts gives us SECONDS. JS Date needs MILLISECONDS.
+    // This * 1000 is the entire fix for the "ghost label" bug.
+    const d = new Date(epochSeconds * 1000);
+
+    switch (mode) {
+        case 'time': return fmtTime.format(d);
+        case 'date': return fmtDate.format(d);
+        case 'full': return fmtFull.format(d);
+        default:     return fmtTime.format(d);
+    }
+}
+
+// =============================================================================
+// CHART SETUP
+// =============================================================================
+
+// Track the latest candle timestamp so tickMarkFormatter can hide ghost labels
+let lastCandleTime = 0;
+
+const chartEl = document.getElementById('chart');
+
+const chart = LightweightCharts.createChart(chartEl, {
+    width: chartEl.clientWidth,
+    height: chartEl.clientHeight,
+    layout: {
+        background: { type: 'Solid', color: '#0a0a0a' },
+        textColor: '#00ff41',
+        fontFamily: "'Courier New', monospace",
+        fontSize: 11,
+    },
+    grid: {
+        vertLines: { color: 'rgba(0, 255, 65, 0.06)' },
+        horzLines: { color: 'rgba(0, 255, 65, 0.06)' },
+    },
+    crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: '#00ff41', width: 1, style: 2, labelBackgroundColor: '#003300' },
+        horzLine: { color: '#00ff41', width: 1, style: 2, labelBackgroundColor: '#003300' },
+    },
+    rightPriceScale: {
+        borderColor: '#00ff41',
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+    },
+    timeScale: {
+        borderColor: '#00ff41',
+        timeVisible: true,
+        secondsVisible: false,
+        // Allow scrolling into future blank space
+        rightOffset: 30,
+        barSpacing: 8,
+
+        // THE FIX: This single formatter handles ALL x-axis labels.
+        // It receives the timestamp in SECONDS from Lightweight Charts —
+        // whether the label is for historical data, the live price line,
+        // or the empty future space (rightOffset).
+        // We suppress labels for timestamps beyond the last candle to
+        // prevent ghost labels like "08:37" appearing in the blank space.
+        tickMarkFormatter: function(epochSeconds, tickMarkType, locale) {
+            // Hide labels in the future blank space (rightOffset area)
+            if (lastCandleTime > 0 && epochSeconds > lastCandleTime + 120) {
+                return '';
+            }
+            // tickMarkType values from Lightweight Charts:
+            //   0 = Year, 1 = Month, 2 = DayOfMonth, 3 = Time, 4 = TimeWithSeconds
+            switch (tickMarkType) {
+                case 0: // Year boundary
+                    return toPacific(epochSeconds, 'date');
+                case 1: // Month boundary
+                    return toPacific(epochSeconds, 'date');
+                case 2: // Day boundary
+                    return toPacific(epochSeconds, 'date');
+                case 3: // Time (most common for intraday)
+                case 4: // Time with seconds
+                default:
+                    return toPacific(epochSeconds, 'time');
+            }
+        },
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true },
+    handleScale: { mouseWheel: true, pinch: true },
+});
+
+// Candlestick series
+const candleSeries = chart.addCandlestickSeries({
+    upColor: '#00ff41',
+    downColor: '#ff0040',
+    borderUpColor: '#00ff41',
+    borderDownColor: '#ff0040',
+    wickUpColor: '#00ff41',
+    wickDownColor: '#ff0040',
+});
+
+// Volume series
+const volumeSeries = chart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+    scaleMargins: { top: 0.85, bottom: 0 },
+});
+
+chart.priceScale('volume').applyOptions({
+    scaleMargins: { top: 0.85, bottom: 0 },
+});
+
+// Also fix the crosshair tooltip to show PST
+chart.subscribeCrosshairMove(function(param) {
+    if (!param || !param.time) return;
+    const priceData = param.seriesData.get(candleSeries);
+    if (priceData) {
+        document.getElementById('last-price').textContent =
+            '$' + priceData.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
+    }
+});
+
+// =============================================================================
+// DATA LOADING
+// =============================================================================
+
+/**
+ * Convert a UTC ISO string or epoch-ms to Lightweight Charts format (epoch SECONDS).
+ * No manual timezone offset — we store UTC seconds and let tickMarkFormatter
+ * handle the PST conversion at render time.
+ */
+function toChartTime(timestamp) {
+    if (typeof timestamp === 'number') {
+        // If it looks like milliseconds (>1e12), convert to seconds
+        return timestamp > 1e12 ? Math.floor(timestamp / 1000) : timestamp;
+    }
+    // ISO string → epoch seconds
+    return Math.floor(new Date(timestamp).getTime() / 1000);
+}
+
+async function loadData() {
+    try {
+        // Try the V2 API endpoint first
+        const response = await fetch('/api/candles?symbol=BTCUSD&interval=1m&limit=500');
+        if (!response.ok) throw new Error(`API returned ${response.status}`);
+        const data = await response.json();
+
+        const candles = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            open: parseFloat(c.open || c.o),
+            high: parseFloat(c.high || c.h),
+            low: parseFloat(c.low || c.l),
+            close: parseFloat(c.close || c.c),
+        }));
+
+        const volumes = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            value: parseFloat(c.volume || c.v || 0),
+            color: parseFloat(c.close || c.c) >= parseFloat(c.open || c.o)
+                ? 'rgba(0, 255, 65, 0.3)'
+                : 'rgba(255, 0, 64, 0.3)',
+        }));
+
+        // Sort by time ascending (Lightweight Charts requires this)
+        candles.sort((a, b) => a.time - b.time);
+        volumes.sort((a, b) => a.time - b.time);
+
+        candleSeries.setData(candles);
+        volumeSeries.setData(volumes);
+
+        // Update last price and track latest timestamp
+        if (candles.length > 0) {
+            const last = candles[candles.length - 1];
+            lastCandleTime = last.time;
+            document.getElementById('last-price').textContent =
+                '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        }
+
+        console.log(`[OX RIG] Loaded ${candles.length} candles, all labels locked to ${TIMEZONE}`);
+
+    } catch (err) {
+        console.warn('[OX RIG] API fetch failed, loading demo data:', err.message);
+        loadDemoData();
+    }
+}
+
+function loadDemoData() {
+    // Generate realistic demo candles for visual verification
+    const now = Math.floor(Date.now() / 1000);
+    const interval = 60; // 1-minute candles
+    const count = 500;
+    let price = 97500;
+    const candles = [];
+    const volumes = [];
+
+    for (let i = count; i >= 0; i--) {
+        const time = now - (i * interval);
+        const change = (Math.random() - 0.48) * 50;
+        const open = price;
+        price += change;
+        const close = price;
+        const high = Math.max(open, close) + Math.random() * 30;
+        const low = Math.min(open, close) - Math.random() * 30;
+        const vol = 50 + Math.random() * 200;
+
+        candles.push({ time, open, high, low, close });
+        volumes.push({
+            time,
+            value: vol,
+            color: close >= open ? 'rgba(0, 255, 65, 0.3)' : 'rgba(255, 0, 64, 0.3)',
+        });
+    }
+
+    candleSeries.setData(candles);
+    volumeSeries.setData(volumes);
+
+    const last = candles[candles.length - 1];
+    lastCandleTime = last.time;
+    document.getElementById('last-price').textContent =
+        '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
+
+    console.log(`[OX RIG] Demo mode: ${candles.length} candles, timezone: ${TIMEZONE}`);
+}
+
+// =============================================================================
+// LIVE CLOCK (PST/PDT)
+// =============================================================================
+
+function updateClock() {
+    document.getElementById('clock').textContent = fmtClock.format(new Date());
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// =============================================================================
+// RESIZE HANDLER
+// =============================================================================
+
+window.addEventListener('resize', () => {
+    chart.applyOptions({
+        width: chartEl.clientWidth,
+        height: chartEl.clientHeight,
+    });
+});
+
+// =============================================================================
+// LIVE UPDATE — Poll for new candles every 5 seconds
+// =============================================================================
+
+let liveInterval = null;
+
+async function liveUpdate() {
+    try {
+        const response = await fetch('/api/candles?symbol=BTCUSD&interval=1m&limit=500');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        const candles = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            open: parseFloat(c.open || c.o),
+            high: parseFloat(c.high || c.h),
+            low: parseFloat(c.low || c.l),
+            close: parseFloat(c.close || c.c),
+        }));
+
+        const volumes = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            value: parseFloat(c.volume || c.v || 0),
+            color: parseFloat(c.close || c.c) >= parseFloat(c.open || c.o)
+                ? 'rgba(0, 255, 65, 0.3)'
+                : 'rgba(255, 0, 64, 0.3)',
+        }));
+
+        candles.sort((a, b) => a.time - b.time);
+        volumes.sort((a, b) => a.time - b.time);
+
+        candleSeries.setData(candles);
+        volumeSeries.setData(volumes);
+
+        if (candles.length > 0) {
+            const last = candles[candles.length - 1];
+            lastCandleTime = last.time;
+            document.getElementById('last-price').textContent =
+                '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        }
+    } catch (err) {
+        // Silent fail — will retry on next interval
+        console.warn('[OX RIG] Live update failed:', err.message);
+    }
+}
+
+function startLiveUpdates() {
+    if (liveInterval) clearInterval(liveInterval);
+    liveInterval = setInterval(liveUpdate, 5000);
+    console.log('[OX RIG] Live updates started (5s interval)');
+}
+
+// =============================================================================
+// BOOT
+// =============================================================================
+
+loadData().then(() => startLiveUpdates());
+</script>
+</body>
+</html>

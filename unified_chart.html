@@ -136,6 +136,9 @@ function toPacific(epochSeconds, mode) {
 // CHART SETUP
 // =============================================================================
 
+// Track the latest candle timestamp so tickMarkFormatter can hide ghost labels
+let lastCandleTime = 0;
+
 const chartEl = document.getElementById('chart');
 
 const chart = LightweightCharts.createChart(chartEl, {
@@ -172,7 +175,13 @@ const chart = LightweightCharts.createChart(chartEl, {
         // It receives the timestamp in SECONDS from Lightweight Charts —
         // whether the label is for historical data, the live price line,
         // or the empty future space (rightOffset).
+        // We suppress labels for timestamps beyond the last candle to
+        // prevent ghost labels like "08:37" appearing in the blank space.
         tickMarkFormatter: function(epochSeconds, tickMarkType, locale) {
+            // Hide labels in the future blank space (rightOffset area)
+            if (lastCandleTime > 0 && epochSeconds > lastCandleTime + 120) {
+                return '';
+            }
             // tickMarkType values from Lightweight Charts:
             //   0 = Year, 1 = Month, 2 = DayOfMonth, 3 = Time, 4 = TimeWithSeconds
             switch (tickMarkType) {
@@ -272,9 +281,10 @@ async function loadData() {
         candleSeries.setData(candles);
         volumeSeries.setData(volumes);
 
-        // Update last price
+        // Update last price and track latest timestamp
         if (candles.length > 0) {
             const last = candles[candles.length - 1];
+            lastCandleTime = last.time;
             document.getElementById('last-price').textContent =
                 '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
         }
@@ -318,6 +328,7 @@ function loadDemoData() {
     volumeSeries.setData(volumes);
 
     const last = candles[candles.length - 1];
+    lastCandleTime = last.time;
     document.getElementById('last-price').textContent =
         '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
 
@@ -346,10 +357,62 @@ window.addEventListener('resize', () => {
 });
 
 // =============================================================================
+// LIVE UPDATE — Poll for new candles every 5 seconds
+// =============================================================================
+
+let liveInterval = null;
+
+async function liveUpdate() {
+    try {
+        const response = await fetch('/api/candles?symbol=BTCUSD&interval=1m&limit=500');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        const candles = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            open: parseFloat(c.open || c.o),
+            high: parseFloat(c.high || c.h),
+            low: parseFloat(c.low || c.l),
+            close: parseFloat(c.close || c.c),
+        }));
+
+        const volumes = data.map(c => ({
+            time: toChartTime(c.time || c.timestamp || c.t),
+            value: parseFloat(c.volume || c.v || 0),
+            color: parseFloat(c.close || c.c) >= parseFloat(c.open || c.o)
+                ? 'rgba(0, 255, 65, 0.3)'
+                : 'rgba(255, 0, 64, 0.3)',
+        }));
+
+        candles.sort((a, b) => a.time - b.time);
+        volumes.sort((a, b) => a.time - b.time);
+
+        candleSeries.setData(candles);
+        volumeSeries.setData(volumes);
+
+        if (candles.length > 0) {
+            const last = candles[candles.length - 1];
+            lastCandleTime = last.time;
+            document.getElementById('last-price').textContent =
+                '$' + last.close.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        }
+    } catch (err) {
+        // Silent fail — will retry on next interval
+        console.warn('[OX RIG] Live update failed:', err.message);
+    }
+}
+
+function startLiveUpdates() {
+    if (liveInterval) clearInterval(liveInterval);
+    liveInterval = setInterval(liveUpdate, 5000);
+    console.log('[OX RIG] Live updates started (5s interval)');
+}
+
+// =============================================================================
 // BOOT
 // =============================================================================
 
-loadData();
+loadData().then(() => startLiveUpdates());
 </script>
 </body>
 </html>
